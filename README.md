@@ -17,6 +17,11 @@ This tool is intended to make rest allowance models quickly accessible for scien
 - **Context-Aware Inputs**: The ET model selector is only active when the chosen RA model uses MHT
 - **Rest Time in Seconds**: RA percentages are converted to absolute rest time and shown prominently
 - **Interactive Visualization**: Rest time vs holding time, rest time vs intensity, work–rest cycles, and the ET curve supplying MHT
+- **Model Overview Plot**: A Rohmert-style family of iso-intensity curves (solid every 10% MVC, dashed at 5% steps) showing rest time vs holding time for the selected RA and ET models, with:
+  - Lines ending at MHT, joined by a grey exhaustion boundary (hold = MHT)
+  - Colour graded by intensity in the RA model's colour
+  - The current task marked with a star
+  - Optional log-scale y-axis and a normalised view (fMHT on the x-axis, RA % on the y-axis) that shows each RA model's structure independent of holding time in seconds
 - **Model Comparison Page**: Side-by-side table, bar chart, and an intensity × holding time heatmap for any model
 - **Domain Checking**: Inputs outside a model's valid range are flagged rather than returning misleading values
 
