@@ -232,9 +232,8 @@ def result_card(res):
 # ============================================================================
 
 AXIS_STYLE = dict(
-    showline=True, linecolor='black', linewidth=1.5,              # edge lines stay visible when zoomed
-    zeroline=True, zerolinecolor='black', zerolinewidth=1.5,      # x = 0 / y = 0 lines when in view
-    ticks='outside', tickcolor='black',
+    showline=False,                                               # no outer edge lines
+    zeroline=True, zerolinecolor='black', zerolinewidth=2,        # bold x = 0 / y = 0 lines inside the plot
 )
 
 
