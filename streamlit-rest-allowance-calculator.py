@@ -231,6 +231,23 @@ def result_card(res):
 # PLOTS
 # ============================================================================
 
+AXIS_STYLE = dict(
+    showline=True, linecolor='black', linewidth=1.5,              # edge lines stay visible when zoomed
+    zeroline=True, zerolinecolor='black', zerolinewidth=1.5,      # x = 0 / y = 0 lines when in view
+    ticks='outside', tickcolor='black',
+)
+
+
+def show_chart(fig, **kwargs):
+    """Apply shared axis styling, then render. Every chart in the app goes through here."""
+    fig.update_xaxes(**AXIS_STYLE)
+    fig.update_yaxes(**AXIS_STYLE)
+    # Rest/time axes are never negative: start linear y-axes at 0 so the zero line sits on the axis
+    fig.update_yaxes(rangemode='tozero', selector=dict(type='linear'))
+    kwargs.setdefault('width', 'stretch')
+    st.plotly_chart(fig, **kwargs)
+
+
 def _layout(fig, title, xtitle, ytitle, y_scale, x_range=None, y_range=None, height=550):
     yaxis = dict(title=ytitle, type='log' if y_scale == 'log' else 'linear',
                  gridcolor='lightgray', showgrid=True)
@@ -748,17 +765,17 @@ if st.session_state.current_page == "Calculator":
     tab1, tab2, tab3, tab4, tab5 = st.tabs(["Rest vs Holding Time", "Rest vs Intensity", "Work–Rest Cycle",
                                             "Endurance Time (MHT)", "Model Overview"])
     with tab1:
-        st.plotly_chart(plot_rest_vs_holding(res, plot_models, plot_et, y_scale_val), width="stretch")
+        show_chart(plot_rest_vs_holding(res, plot_models, plot_et, y_scale_val), width="stretch")
         st.caption("MHT-based curves end where holding time reaches MHT (fMHT = 1); beyond that the task cannot be sustained.")
     with tab2:
-        st.plotly_chart(plot_rest_vs_intensity(res, plot_models, plot_et, y_scale_val), width="stretch")
+        show_chart(plot_rest_vs_intensity(res, plot_models, plot_et, y_scale_val), width="stretch")
         st.caption("MHT-based curves end at the intensity where MHT falls below the holding time.")
     with tab3:
         cyc = all_results if overlay else [res]
-        st.plotly_chart(plot_work_rest_cycles(cyc, ra_model), width="stretch")
+        show_chart(plot_work_rest_cycles(cyc, ra_model), width="stretch")
     with tab4:
         if uses_mht or overlay:
-            st.plotly_chart(plot_et_curve(res, et_model, y_scale_val), width="stretch")
+            show_chart(plot_et_curve(res, et_model, y_scale_val), width="stretch")
             st.caption("The task is feasible for MHT-based models when the curve sits above the holding-time line at the task intensity.")
         else:
             st.info(f"{ra_model} does not use MHT. Enable the overlay above to view the ET curve used by the other models.")
@@ -784,7 +801,7 @@ if st.session_state.current_page == "Calculator":
                                           f"model (up to {OVERVIEW_AUTO_CAP_S:,} s). Enter a larger value "
                                           "to see more of the low-intensity lines.")
         hold_max = float(x_user) if x_user else overview_auto_xmax(ra_model, et_model, show_5, holding_s)
-        st.plotly_chart(plot_model_overview(res, ra_model, et_model, hold_max, show_5, show_star, log_y, normalised),
+        show_chart(plot_model_overview(res, ra_model, et_model, hold_max, show_5, show_star, log_y, normalised),
                         width="stretch")
         if normalised:
             note = {
@@ -858,7 +875,7 @@ elif st.session_state.current_page == "Compare":
     _layout(fig, f"Rest Time for a {holding_s:g} s Hold at {pct_mvc:g}% MVC", "", "Rest Time (seconds)",
             y_scale_val, height=450)
     fig.update_layout(showlegend=False)
-    st.plotly_chart(fig, width="stretch")
+    show_chart(fig, width="stretch")
 
     st.markdown("---")
     st.markdown("### Rest Time Map (Intensity × Holding Time)")
@@ -869,7 +886,7 @@ elif st.session_state.current_page == "Compare":
         hold_max = st.slider("Max Holding Time (s)", 10, 600, int(max(60, min(600, holding_s * 2))), step=10)
     hm_model = st.session_state.heatmap_model
     current = compute_rest_allowance(hm_model, pct_mvc, holding_s, et_model)
-    st.plotly_chart(plot_heatmap(hm_model, et_model if model_uses_mht(hm_model) else None, hold_max, current),
+    show_chart(plot_heatmap(hm_model, et_model if model_uses_mht(hm_model) else None, hold_max, current),
                     width="stretch")
     st.caption("Blank cells are outside the model's valid domain (holding time > MHT, ET undefined, or "
                "Milner fMHT ≤ 0.01). Colour scale is logarithmic in rest seconds.")
