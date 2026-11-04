@@ -1,6 +1,7 @@
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
+from plotly.colors import sample_colorscale
 import streamlit as st
 
 from et_models import (
@@ -17,7 +18,9 @@ from ra_models import (
     RA_COLORS,
     RA_MODEL_INFO,
     RA_MODEL_ORDER,
+    MILNER_1985,
     ROHMERT_1973,
+    ROSE_1992,
     compute_rest_allowance,
     model_uses_mht,
     rest_time_seconds,
@@ -251,10 +254,13 @@ def _line_style(model, selected):
     return dict(color=RA_COLORS[model], width=2, dash='dot')
 
 
+STAR_GOLD = '#FFC72C'  # current-task marker: gold fill, black outline (neutral against every RA model colour)
+
+
 def _star(fig, x, y, text):
     fig.add_trace(go.Scatter(
         x=[x], y=[y], mode='markers', name='Current Task',
-        marker=dict(color=COLORS['tech_tangerine'], size=20, symbol='star',
+        marker=dict(color=STAR_GOLD, size=20, symbol='star',
                     line=dict(color='black', width=2)),
         hovertemplate=text + "<extra></extra>"
     ))
@@ -372,6 +378,240 @@ def plot_et_curve(res, et_model, y_scale):
     _layout(fig, "Endurance Time Curve Supplying MHT", "Intensity (% MVC)",
             "Maximum Holding Time (seconds)", y_scale, x_range=[0, 100], y_range=[0, ref * 3])
     fig.update_layout(legend=dict(xanchor="right", x=0.99))
+    return fig
+
+
+OVERVIEW_AUTO_CAP_S = 12_000  # 200 min: upper limit for the automatic x-axis range
+OVERVIEW_AUTO_MIN_PCT = 20    # auto x-range spans the MHT of the lowest line at/above this intensity
+OVERVIEW_PCT_RANGE = (5, 100)  # intensity range mapped onto the colour gradient
+BOUNDARY_COLOR = '#9AA0A6'
+LOG_DECADES = 4               # log y-axis shows this many decades below the largest value
+
+
+def overview_intensities(show_5):
+    step = 5 if show_5 else 10
+    return list(range(step, 101, step))
+
+
+def overview_auto_xmax(ra_model, et_model, show_5, holding_s):
+    """
+    Longest finite MHT among the plotted intensities >= 20% MVC (capped), or a holding-based range
+    if MHT is not used. Lines below 20% have very long MHTs (and are RA = 0 for Rohmert below 15%),
+    so including them would compress the rest of the family; they are drawn but clipped at this range.
+    """
+    if not model_uses_mht(ra_model):
+        return max(600.0, holding_s * 2)
+    mhts = [mht_seconds(p / 100, et_model) for p in overview_intensities(show_5) if p >= OVERVIEW_AUTO_MIN_PCT]
+    mhts = [m for m in mhts if np.isfinite(m) and m > 0]
+    longest = max(mhts) if mhts else 600.0
+    return float(min(max(longest, holding_s * 1.2), OVERVIEW_AUTO_CAP_S))
+
+
+# --- colour gradient by intensity -------------------------------------------
+
+OVERVIEW_TINT = 0.72  # how far the lowest intensity is blended toward white
+
+
+def _hex_to_rgb(h):
+    h = h.lstrip('#')
+    return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
+
+
+def _mix(rgb, target, t):
+    return tuple(round(a + (b - a) * t) for a, b in zip(rgb, target))
+
+
+def intensity_colorscale(ra_model):
+    """
+    Light-to-dark scale for intensity, anchored on the RA model's own line colour (RA_COLORS),
+    so the overview matches the scenario plots: 100% MVC = the model colour, low intensity = a light tint.
+    """
+    base = _hex_to_rgb(RA_COLORS[ra_model])
+    light = _mix(base, (255, 255, 255), OVERVIEW_TINT)
+    return [[0.0, f"rgb{light}"], [1.0, f"rgb{base}"]]
+
+
+def intensity_color(pct, scale):
+    lo, hi = OVERVIEW_PCT_RANGE
+    t = min(max((pct - lo) / (hi - lo), 0.0), 1.0)
+    return sample_colorscale(scale, [t])[0]
+
+
+# --- curve data ---------------------------------------------------------------
+
+@st.cache_data(show_spinner=False)
+def overview_curves(ra_model, et_model, hold_max, show_5, normalised, n_pts=300):
+    """
+    One curve per intensity. Each curve is a dict with p, hold, rest, fmht, ra (arrays).
+    Seconds mode: holding time from 0 to MHT (or hold_max, whichever is shorter).
+    Normalised mode: fMHT from 0 to 1 (MHT-based models only).
+    """
+    curves = []
+    uses_mht = model_uses_mht(ra_model)
+    for p in overview_intensities(show_5):
+        mht = mht_seconds(p / 100, et_model) if uses_mht else np.nan
+        mht_ok = np.isfinite(mht) and mht > 0
+        if normalised:
+            fm = np.linspace(0, 1, n_pts + 1)[1:]
+            if mht_ok:
+                holds = fm * mht
+            elif ra_model == ROHMERT_1973 and p <= 15:   # RA = 0 regardless of MHT
+                curves.append(dict(p=p, hold=np.full_like(fm, np.nan), rest=np.zeros_like(fm),
+                                   fmht=fm, ra=np.zeros_like(fm)))
+                continue
+            else:
+                continue
+        else:
+            end = min(mht, hold_max) if mht_ok else hold_max
+            holds = np.linspace(0, end, n_pts + 1)[1:]
+        rs = [compute_rest_allowance(ra_model, p, h, et_model) for h in holds]
+        c = dict(p=p, hold=holds,
+                 rest=np.array([r.rest_s for r in rs]),
+                 fmht=holds / mht if mht_ok else np.full_like(holds, np.nan),
+                 ra=np.array([r.ra_pct for r in rs]))
+        if np.any(np.isfinite(c['rest'])) or np.any(np.isfinite(c['ra'])):
+            curves.append(c)
+    return curves
+
+
+@st.cache_data(show_spinner=False)
+def exhaustion_boundary(ra_model, et_model, hold_max):
+    """Rest time for a hold that lasts exactly MHT (fMHT = 1), across intensities, within the x-range."""
+    pcts, holds, rests = [], [], []
+    for p in np.arange(1.0, 100.01, 0.5):
+        mht = mht_seconds(p / 100, et_model)
+        if not (np.isfinite(mht) and 0 < mht <= hold_max):
+            continue
+        r = compute_rest_allowance(ra_model, p, mht, et_model).rest_s
+        if np.isfinite(r):
+            pcts.append(p); holds.append(mht); rests.append(r)
+    return np.array(pcts), np.array(holds), np.array(rests)
+
+
+def _group_end_labels(ends):
+    """Merge labels of lines that end at the same point (e.g., Milner normalised: all intensities coincide)."""
+    groups = []
+    for p, x, y in ends:
+        for g in groups:
+            if np.isclose(g['x'], x, rtol=1e-6) and np.isclose(g['y'], y, rtol=1e-6):
+                g['ps'].append(p)
+                break
+        else:
+            groups.append(dict(x=x, y=y, ps=[p]))
+    for g in groups:
+        g['text'] = f"{g['ps'][0]}%" if len(g['ps']) == 1 else f"{min(g['ps'])}–{max(g['ps'])}%"
+    return groups
+
+
+def plot_model_overview(res, ra_model, et_model, hold_max, show_5, show_star, log_y, normalised):
+    uses_mht = model_uses_mht(ra_model)
+    normalised = normalised and uses_mht
+    et_for_model = et_model if uses_mht else None
+    curves = overview_curves(ra_model, et_for_model, hold_max, show_5, normalised)
+    scale = intensity_colorscale(ra_model)
+    xkey, ykey = ('fmht', 'ra') if normalised else ('hold', 'rest')
+
+    fig = go.Figure()
+    all_y = []
+
+    # Exhaustion boundary first so it sits behind the intensity lines
+    if uses_mht and not normalised:
+        bp, bx, by = exhaustion_boundary(ra_model, et_model, hold_max)
+        if len(bx):
+            fig.add_trace(go.Scatter(
+                x=bx, y=by, mode='lines', name='Exhaustion boundary (hold = MHT)',
+                line=dict(color=BOUNDARY_COLOR, width=1.2), customdata=bp,
+                hovertemplate="<b>Exhaustion boundary</b><br>%{customdata:.1f}% MVC<br>"
+                              "Hold = MHT = %{x:,.1f} s<br>Rest: %{y:,.1f} s<extra></extra>"
+            ))
+            all_y.extend(by.tolist())
+
+    ends, zero_lines = [], []
+    for c in curves:
+        p, xs, ys = c['p'], c[xkey], c[ykey]
+        solid = p % 10 == 0
+        col = intensity_color(p, scale)
+        if normalised:
+            hover = (f"<b>{p}% MVC</b><br>fMHT: %{{x:.3f}}<br>RA: %{{y:,.1f}}%<br>"
+                     f"Holding: %{{customdata[0]:,.1f}} s<br>Rest: %{{customdata[1]:,.1f}} s<extra></extra>")
+            cd = np.column_stack([c['hold'], c['rest']])
+        else:
+            hover = f"<b>{p}% MVC</b><br>Holding: %{{x:,.1f}} s<br>Rest: %{{y:,.1f}} s<extra></extra>"
+            cd = None
+        fig.add_trace(go.Scatter(
+            x=xs, y=ys, mode='lines', name=f"{p}% MVC", showlegend=False, customdata=cd,
+            line=dict(color=col, width=2.5 if solid else 1.6, dash=None if solid else 'dash'),
+            hovertemplate=hover
+        ))
+        finite = np.isfinite(ys)
+        all_y.extend(ys[finite].tolist())
+        if np.all(ys[finite] == 0):
+            zero_lines.append(p)
+        elif solid:
+            i = np.where(finite)[0][-1]
+            ends.append((p, xs[i], ys[i]))
+
+    # y-axis range (log needs an explicit floor: Rohmert/Milner approach 0 as holding time -> 0)
+    pos = [v for v in all_y if v > 0]
+    star_ok = show_star and res.ok and (not normalised or np.isfinite(res.fmht))
+    if star_ok:
+        sy = res.ra_pct if normalised else res.rest_s
+        if sy > 0:
+            pos.append(sy)
+    y_top = max(pos) if pos else 1.0
+    y_floor = y_top / 10 ** LOG_DECADES
+
+    def y_pos(v):  # annotation y in axis units
+        return np.log10(max(v, y_floor)) if log_y else v
+
+    # End labels: skip any that would overlap one already placed (the colour bar is the full key)
+    x_span = 1.0 if normalised else max(hold_max, res.holding_s if star_ok else 0)
+    y_lo, y_hi = (np.log10(y_floor), np.log10(y_top)) if log_y else (0.0, y_top)
+    placed = []
+    for g in sorted(_group_end_labels(ends), key=lambda g: min(g['ps'])):
+        gx, gy = g['x'] / x_span, (y_pos(g['y']) - y_lo) / max(y_hi - y_lo, 1e-12)
+        if any(abs(gx - px) < 0.06 and abs(gy - py) < 0.035 for px, py in placed):
+            continue
+        placed.append((gx, gy))
+        fig.add_annotation(x=g['x'], y=y_pos(g['y']), text=g['text'], showarrow=False, xanchor='left',
+                           xshift=4, font=dict(size=11, color=intensity_color(max(g['ps']), scale)))
+    if zero_lines and not log_y:
+        x_lab = 1.0 if normalised else hold_max
+        fig.add_annotation(x=x_lab, y=0, text=f"≤{max(zero_lines)}%: RA = 0", showarrow=False,
+                           xanchor='right', yanchor='bottom', font=dict(size=11, color=COLORS['dark_grey']))
+
+    # Colour bar keyed to intensity
+    lo, hi = OVERVIEW_PCT_RANGE
+    fig.add_trace(go.Scatter(
+        x=[None], y=[None], mode='markers', showlegend=False, hoverinfo='skip',
+        marker=dict(colorscale=scale, cmin=lo, cmax=hi, color=[lo], showscale=True,
+                    colorbar=dict(title=dict(text="% MVC"), thickness=12, len=0.7,
+                                  tickvals=[10, 20, 40, 60, 80, 100]))
+    ))
+
+    if normalised:
+        x_max = 1.0
+        if star_ok:
+            _star(fig, res.fmht, res.ra_pct,
+                  f"<b>Current Task</b><br>{res.pct_mvc:g}% MVC, fMHT = {res.fmht:.3f}<br>"
+                  f"RA: {res.ra_pct:.1f}% · Rest: {res.rest_s:.1f} s")
+        title = f"Overview of {ra_model}, normalised to MHT"
+        xt, yt = "fMHT (holding time ÷ MHT)", "Rest Allowance (% of holding time)"
+    else:
+        x_max = hold_max
+        if star_ok:
+            _star(fig, res.holding_s, res.rest_s,
+                  f"<b>Current Task</b><br>{res.pct_mvc:g}% MVC, {res.holding_s:g} s hold<br>Rest: {res.rest_s:.1f} s")
+            x_max = max(x_max, res.holding_s)
+        title = f"Overview of {ra_model}" + (f" (MHT: {et_model})" if et_for_model else "")
+        xt, yt = "Holding Time (seconds)", "Rest Time (seconds)"
+
+    _layout(fig, title, xt, yt, 'log' if log_y else 'linear', x_range=[0, x_max * 1.07], height=600)
+    if log_y:
+        fig.update_yaxes(range=[np.log10(y_floor), np.log10(y_top * 1.5)], dtick=1)
+    fig.update_layout(title=dict(font=dict(size=18)),
+                      legend=dict(orientation='h', yanchor='bottom', y=1.0, xanchor='left', x=0,
+                                  bgcolor='rgba(255,255,255,0)'))
     return fig
 
 
@@ -505,7 +745,8 @@ if st.session_state.current_page == "Calculator":
     plot_models = RA_MODEL_ORDER if overlay else [ra_model]
     plot_et = et_model if (uses_mht or overlay) else None
 
-    tab1, tab2, tab3, tab4 = st.tabs(["Rest vs Holding Time", "Rest vs Intensity", "Work–Rest Cycle", "Endurance Time (MHT)"])
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(["Rest vs Holding Time", "Rest vs Intensity", "Work–Rest Cycle",
+                                            "Endurance Time (MHT)", "Model Overview"])
     with tab1:
         st.plotly_chart(plot_rest_vs_holding(res, plot_models, plot_et, y_scale_val), width="stretch")
         st.caption("MHT-based curves end where holding time reaches MHT (fMHT = 1); beyond that the task cannot be sustained.")
@@ -521,6 +762,53 @@ if st.session_state.current_page == "Calculator":
             st.caption("The task is feasible for MHT-based models when the curve sits above the holding-time line at the task intensity.")
         else:
             st.info(f"{ra_model} does not use MHT. Enable the overlay above to view the ET curve used by the other models.")
+    with tab5:
+        o1, o2, o3 = st.columns([1, 1, 1.4])
+        with o1:
+            show_star = st.checkbox("Show current task (★)", value=True, key="ov_star")
+            show_5 = st.checkbox("Show 5% lines (dashed)", value=True, key="ov_5")
+        with o2:
+            log_y = st.checkbox("Log scale (y-axis)", value=(y_scale_val == 'log'), key="ov_log")
+            normalised = st.checkbox(
+                "Normalise to MHT (fMHT)", value=False, key="ov_norm", disabled=not uses_mht,
+                help="x = holding time ÷ MHT (0–1), y = rest allowance as % of holding time. "
+                     "Shows the RA model's own structure: every line ends at fMHT = 1."
+                     if uses_mht else f"Not available: {ra_model} does not use MHT."
+            )
+            normalised = normalised and uses_mht
+        with o3:
+            x_user = st.number_input("Max holding time shown (s)", min_value=1.0, value=None,
+                                     step=60.0, format="%.0f", placeholder="Auto", key="ov_xmax",
+                                     disabled=normalised,
+                                     help="Leave blank for automatic: MHT at 20% MVC for the selected ET "
+                                          f"model (up to {OVERVIEW_AUTO_CAP_S:,} s). Enter a larger value "
+                                          "to see more of the low-intensity lines.")
+        hold_max = float(x_user) if x_user else overview_auto_xmax(ra_model, et_model, show_5, holding_s)
+        st.plotly_chart(plot_model_overview(res, ra_model, et_model, hold_max, show_5, show_star, log_y, normalised),
+                        width="stretch")
+        if normalised:
+            note = {
+                ROHMERT_1973: "Rohmert (1973) RA % depends only on fMHT and %MVC, so this view is the same "
+                              "for every ET model.",
+                MILNER_1985: "Milner (1985) RA % depends only on fMHT, so all intensities collapse onto one "
+                             "curve, and it is the same for every ET model.",
+                ROSE_1992: "Rose et al. (1992) RA % depends only on MHT, so each intensity is a flat line "
+                           "whose level is set by the ET model.",
+            }.get(ra_model, "")
+            st.caption("Each line is one contraction intensity (solid every 10% MVC, dashed at the 5% steps), "
+                       "coloured light to dark by intensity. " + note + " Drag to zoom, double-click to reset.")
+        else:
+            st.caption("Each line is one contraction intensity (solid every 10% MVC, dashed at the 5% steps), "
+                       "coloured light to dark by intensity. "
+                       + ("Lines end at MHT for that intensity; the grey line joins those endpoints (exhaustion "
+                          "boundary). Lines whose MHT is beyond the x-axis range are cut off at its edge. "
+                          if uses_mht else "")
+                       + ("On the log scale, lines at RA = 0 (≤15% MVC) are not shown. " if log_y else "")
+                       + "Drag to zoom, double-click to reset.")
+        if show_star and not res.ok:
+            st.warning(f"The current task can't be starred: {short_status(res).lower()}.")
+        elif show_star and normalised and not np.isfinite(res.fmht):
+            st.warning("The current task can't be starred in the normalised view: MHT is undefined at this intensity.")
 
 
 # ============================================================================
