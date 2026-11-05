@@ -1,5 +1,4 @@
 import numpy as np
-import pandas as pd
 import plotly.graph_objects as go
 from plotly.colors import sample_colorscale
 import streamlit as st
@@ -104,7 +103,18 @@ DEFAULTS = {
     'ra_model': ROHMERT_1973,
     'et_region': DEFAULT_ET_REGION,
     'et_model': DEFAULT_ET_MODEL,
-    'heatmap_model': ROHMERT_1973,
+    # Compare page: two independent RA + ET pairings
+    'cmp1_ra_model': ROHMERT_1973,
+    'cmp1_et_region': DEFAULT_ET_REGION,
+    'cmp1_et_model': DEFAULT_ET_MODEL,
+    'cmp2_ra_model': MILNER_1985,
+    'cmp2_et_region': DEFAULT_ET_REGION,
+    'cmp2_et_model': DEFAULT_ET_MODEL,
+    # Compare page: optional piecewise (compound) function per slot
+    'cmp1_pw': False, 'cmp1_pw_t': 35.0,
+    'cmp1b_ra_model': ROSE_1992, 'cmp1b_et_region': DEFAULT_ET_REGION, 'cmp1b_et_model': DEFAULT_ET_MODEL,
+    'cmp2_pw': False, 'cmp2_pw_t': 35.0,
+    'cmp2b_ra_model': ROSE_1992, 'cmp2b_et_region': DEFAULT_ET_REGION, 'cmp2b_et_model': DEFAULT_ET_MODEL,
 }
 for k, v in DEFAULTS.items():
     if k not in st.session_state:
@@ -115,9 +125,10 @@ def _copy_from_widget(key):
     st.session_state[key] = st.session_state[f"w_{key}"]
 
 
-def _on_region_change():
-    st.session_state.et_region = st.session_state.w_et_region
-    st.session_state.et_model = ET_MODEL_CATEGORIES[st.session_state.et_region][0]
+def _on_region_change(prefix=""):
+    rk, mk = f"{prefix}et_region", f"{prefix}et_model"
+    st.session_state[rk] = st.session_state[f"w_{rk}"]
+    st.session_state[mk] = ET_MODEL_CATEGORIES[st.session_state[rk]][0]
 
 
 def _bind(key):
@@ -150,24 +161,29 @@ def render_task_inputs():
     return st.session_state.pct_mvc, st.session_state.holding_s
 
 
-def render_et_selector(enabled, disabled_reason=""):
-    """Region + ET model selectors, greyed out when the RA model does not use MHT."""
+def render_et_selector(enabled, disabled_reason="", prefix=""):
+    """
+    Region + ET model selectors, greyed out when the RA model does not use MHT.
+    `prefix` keeps independent state per selector set (calculator: "", compare slots: "cmp1_", "cmp2_").
+    """
+    rk, mk = f"{prefix}et_region", f"{prefix}et_model"
     st.markdown("**Endurance Time (MHT) Model**")
-    st.session_state.w_et_region = st.session_state.et_region
+    st.session_state[f"w_{rk}"] = st.session_state[rk]
     st.selectbox(
         "Body Region:",
         list(ET_MODEL_CATEGORIES.keys()),
-        key="w_et_region",
+        key=f"w_{rk}",
         on_change=_on_region_change,
+        args=(prefix,),
         disabled=not enabled,
     )
-    options = ET_MODEL_CATEGORIES[st.session_state.et_region]
-    if st.session_state.et_model not in options:
-        st.session_state.et_model = options[0]
-    st.selectbox("ET Model:", options, disabled=not enabled, **_bind('et_model'))
+    options = ET_MODEL_CATEGORIES[st.session_state[rk]]
+    if st.session_state[mk] not in options:
+        st.session_state[mk] = options[0]
+    st.selectbox("ET Model:", options, disabled=not enabled, **_bind(mk))
 
     if enabled:
-        info = get_equation_info().get(st.session_state.et_model)
+        info = get_equation_info().get(st.session_state[mk])
         if info:
             with st.expander("About this ET model"):
                 st.markdown(f"**Muscle Group:** {info['muscle']}")
@@ -176,7 +192,28 @@ def render_et_selector(enabled, disabled_reason=""):
                 st.markdown(f"**Citation:** {info['citation']}")
     else:
         st.caption(disabled_reason)
-    return st.session_state.et_model
+    return st.session_state[mk]
+
+
+def render_ra_selector(prefix=""):
+    """RA model selector with its equation card and 'About' expander. Returns the selected model."""
+    key = f"{prefix}ra_model"
+    st.markdown("**Rest Allowance Model**")
+    st.selectbox("RA Model:", RA_MODEL_ORDER, **_bind(key))
+    ra_model = st.session_state[key]
+    st.markdown(f"""
+    <div class="model-card">
+        <b>{ra_model}</b><br>
+        <code>{RA_MODEL_INFO[ra_model]['equation_text']}</code><br>
+        <small>Inputs: {RA_MODEL_INFO[ra_model]['inputs']}</small>
+    </div>
+    """, unsafe_allow_html=True)
+    render_ra_model_info(ra_model)
+    return ra_model
+
+
+def not_required_reason(ra_model):
+    return f"Not required: {ra_model} uses %MVC only and does not consider MHT."
 
 
 def render_ra_model_info(model):
@@ -208,7 +245,7 @@ def short_status(res):
     }[res.status]
 
 
-def result_card(res):
+def result_card(res, accent=None, heading=None):
     if res.ok:
         rest = res.rest_s
         sub = f"({rest / 60:.2f} minutes) · RA = {res.ra_pct:,.1f}% of holding time"
@@ -216,15 +253,21 @@ def result_card(res):
     else:
         cls, value, sub = "result-card na", "N/A", short_status(res)
     mht_line = f"MHT from: {res.et_model}" if res.et_model else "MHT not used by this model"
-    st.markdown(f"""
-    <div class="{cls}">
-        <div class="result-label">Rest Allowance Time for a {res.holding_s:g} s hold at {res.pct_mvc:g}% MVC</div>
-        <div class="result-value">{value}</div>
-        <div class="result-label">{sub}</div>
-        <br>
-        <div class="result-label">RA Model: {res.model}<br>{mht_line}</div>
-    </div>
-    """, unsafe_allow_html=True)
+    style = f' style="border-color:{accent}; border-width:3px;"' if (accent and res.ok) else ""
+    head = (f'<div class="result-label" style="font-weight:bold; color:{accent or COLORS["future_blue"]};">'
+            f'{heading}</div>') if heading else ""
+    # Built as one line: blank or indented lines inside an HTML block make Markdown render it as a code block
+    html = "".join([
+        f'<div class="{cls}"{style}>',
+        head,
+        f'<div class="result-label">Rest Allowance Time for a {res.holding_s:g} s hold at {res.pct_mvc:g}% MVC</div>',
+        f'<div class="result-value">{value}</div>',
+        f'<div class="result-label">{sub}</div>',
+        '<br>',
+        f'<div class="result-label">RA Model: {res.model}<br>{mht_line}</div>',
+        '</div>',
+    ])
+    st.markdown(html, unsafe_allow_html=True)
 
 
 # ============================================================================
@@ -273,10 +316,10 @@ def _line_style(model, selected):
 STAR_GOLD = '#FFC72C'  # current-task marker: gold fill, black outline (neutral against every RA model colour)
 
 
-def _star(fig, x, y, text):
+def _star(fig, x, y, text, color=STAR_GOLD, name='Current Task'):
     fig.add_trace(go.Scatter(
-        x=[x], y=[y], mode='markers', name='Current Task',
-        marker=dict(color=STAR_GOLD, size=20, symbol='star',
+        x=[x], y=[y], mode='markers', name=name,
+        marker=dict(color=color, size=20, symbol='star',
                     line=dict(color='black', width=2)),
         hovertemplate=text + "<extra></extra>"
     ))
@@ -632,7 +675,7 @@ def plot_model_overview(res, ra_model, et_model, hold_max, show_5, show_star, lo
 
 
 @st.cache_data(show_spinner=False)
-def heatmap_grid(model, et_model, hold_max, n_hold=60):
+def heatmap_grid(model, et_model, hold_max, n_hold=100):
     intensities = np.arange(1, 101, 1.0)
     holds = np.linspace(hold_max / n_hold, hold_max, n_hold)
     z = np.full((len(holds), len(intensities)), np.nan)
@@ -642,23 +685,436 @@ def heatmap_grid(model, et_model, hold_max, n_hold=60):
     return intensities, holds, z
 
 
-def plot_heatmap(model, et_model, hold_max, current):
+def plot_heatmap(model, et_model, hold_max, current, show_star=True):
     xs, ys, z = heatmap_grid(model, et_model, hold_max)
     zc = np.log10(z + 1)  # +1 s so RA = 0 (no fatigue) stays on the scale
-    ticks = [v for v in [0, 1, 10, 100, 1_000, 10_000, 100_000] if v <= np.nanmax(z, initial=0) * 1.01 or v == 0]
+    ticks = [v for v in [0, 1, 10, 100, 1_000, 10_000, 100_000, 1_000_000]
+             if v <= np.nanmax(z, initial=0) * 1.01 or v == 0]
     fig = go.Figure(go.Heatmap(
         x=xs, y=ys, z=zc, customdata=z, colorscale='Viridis',
         colorbar=dict(title="Rest (s)", tickvals=np.log10(np.array(ticks) + 1), ticktext=[f"{t:,}" for t in ticks]),
         hovertemplate="Intensity: %{x:.0f}% MVC<br>Holding: %{y:.1f} s<br>Rest: %{customdata:.1f} s<extra></extra>",
         hoverongaps=False,
     ))
-    if current.ok and current.holding_s <= hold_max:
+    if show_star and current.ok and current.holding_s <= hold_max:
         _star(fig, current.pct_mvc, current.holding_s,
               f"<b>Current Task</b><br>{current.pct_mvc:g}% MVC, {current.holding_s:g} s hold<br>Rest: {current.rest_s:.1f} s")
     fig.update_layout(
-        title=dict(text=f"Rest Time Map: {model}", font=dict(size=20, color=COLORS['future_blue']), x=0.5),
+        title=dict(text=f"Rest Time Heatmap: {model}" + (f" (MHT: {et_model})" if et_model else ""),
+                   font=dict(size=18, color=COLORS['future_blue']), x=0.5),
         xaxis=dict(title="Intensity (% MVC)"), yaxis=dict(title="Holding Time (seconds)"),
         plot_bgcolor='white', height=550, showlegend=False,
+    )
+    return fig
+
+
+# ============================================================================
+# COMPARISON (two RA + ET pairings overlaid; each may be piecewise in intensity)
+# ============================================================================
+
+COMPARE_DASH = {1: None, 2: 'dash'}   # Model 1 solid, Model 2 dashed
+SAME_MODEL_TINT = 0.45                # Model 2 lightened when both slots share a colour
+PIECEWISE_DEFAULT_T = 35.0            # default transition intensity (% MVC)
+
+
+def _lighten(hex_color, t):
+    rgb = _mix(_hex_to_rgb(hex_color), (255, 255, 255), t)
+    return '#%02x%02x%02x' % rgb
+
+
+# --- piecewise model specs -----------------------------------------------------
+#
+# A comparison "model" is one RA + ET pairing (a part), or two parts joined at a
+# transition intensity T: the primary part applies below T, the secondary at/above T.
+
+def _part(prefix):
+    ra = st.session_state[f"{prefix}ra_model"]
+    return dict(ra=ra, et=st.session_state[f"{prefix}et_model"] if model_uses_mht(ra) else None)
+
+
+def _part_label(part):
+    return part['ra'] + (f" + {part['et']}" if part['et'] else "")
+
+
+def part_at(spec, pct):
+    """Part in force at this intensity: primary below the transition, secondary at or above it."""
+    if spec['T'] is None or pct < spec['T']:
+        return spec['parts'][0]
+    return spec['parts'][1]
+
+
+def spec_mht_all(spec):
+    return all(p['et'] for p in spec['parts'])
+
+
+def spec_mht_any(spec):
+    return any(p['et'] for p in spec['parts'])
+
+
+def piecewise_curve(spec, xs, f):
+    """
+    Evaluate f(part, x) along an intensity grid. For a piecewise spec, the primary segment runs up to T,
+    then a gap (NaN), then the secondary segment from T, so the step between models is not drawn as a line.
+    """
+    xs = np.asarray(xs, float)
+    if spec['T'] is None:
+        p = spec['parts'][0]
+        return xs, np.array([f(p, x) for x in xs], float)
+    T = spec['T']
+    xa = np.append(xs[xs < T], T)
+    xb = xs[xs >= T]
+    if not len(xb) or xb[0] != T:
+        xb = np.insert(xb, 0, T)
+    ya = [f(spec['parts'][0], x) for x in xa]
+    yb = [f(spec['parts'][1], x) for x in xb]
+    return np.concatenate([xa, [T], xb]), np.array(ya + [np.nan] + yb, float)
+
+
+def _transition_marks(specs):
+    """(T, label, colour, position) for each transition; a shared transition is drawn once, in black."""
+    ts = [s for s in specs if s['T'] is not None]
+    if len(ts) == 2 and ts[0]['T'] == ts[1]['T']:
+        return [(ts[0]['T'], f"Transition {ts[0]['T']:g}% (both)", 'black', "bottom right")]
+    return [(s['T'], f"{s['short']} transition {s['T']:g}%", s['color'],
+             "bottom left" if s['slot'] == 1 else "bottom right") for s in ts]
+
+
+def _add_transition_lines(fig, specs):
+    for T, label, color, pos in _transition_marks(specs):
+        fig.add_vline(x=T, line_dash="dashdot", line_color=color, opacity=0.9, annotation_text=label,
+                      annotation_font_color=color, annotation_position=pos)
+
+
+def build_compare_specs(pct_mvc, holding_s):
+    """One spec per comparison slot: its part(s), transition, colour, dash, labels and task result."""
+    specs = []
+    for slot in (1, 2):
+        parts = [_part(f"cmp{slot}_")]
+        T = None
+        if st.session_state.get(f"cmp{slot}_pw"):
+            parts.append(_part(f"cmp{slot}b_"))
+            T = float(st.session_state[f"cmp{slot}_pw_t"])
+        spec = dict(slot=slot, parts=parts, T=T, dash=COMPARE_DASH[slot], short=f"M{slot}",
+                    color=RA_COLORS[parts[0]['ra']])
+        active = part_at(spec, pct_mvc)
+        spec.update(ra=active['ra'], et=active['et'],
+                    res=compute_rest_allowance(active['ra'], pct_mvc, holding_s, active['et']))
+        if T is None:
+            spec['name'] = f"Model {slot}: {_part_label(parts[0])}"
+            spec['active_name'] = spec['name']
+        else:
+            spec['name'] = (f"Model {slot}: {_part_label(parts[0])} (<{T:g}%) | "
+                            f"{_part_label(parts[1])} (≥{T:g}%)")
+            spec['active_name'] = (f"Model {slot}: {_part_label(active)} "
+                                   f"({'≥' if pct_mvc >= T else '<'}{T:g}% part)")
+        specs.append(spec)
+    if specs[0]['color'] == specs[1]['color']:
+        specs[1]['color'] = _lighten(specs[1]['color'], SAME_MODEL_TINT)
+    return specs
+
+
+def specs_identical(s1, s2):
+    return s1['parts'] == s2['parts'] and s1['T'] == s2['T']
+
+
+def _spec_star(fig, s, x, y, extra=""):
+    r = s['res']
+    _star(fig, x, y,
+          f"<b>Model {s['slot']}</b> ({r.model})<br>{r.pct_mvc:g}% MVC, {r.holding_s:g} s hold<br>"
+          f"Rest: {r.rest_s:.1f} s{extra}",
+          color=s['color'], name=f"Model {s['slot']} prediction")
+
+
+# --- plots --------------------------------------------------------------------
+
+def cmp_rest_vs_holding(specs, pct, hold, y_scale):
+    """Fixed intensity, so each model uses the single part in force at the task intensity."""
+    mhts = [mht_seconds(pct / 100, s['et']) for s in specs if s['et']]
+    mhts = [m for m in mhts if np.isfinite(m)]
+    x_max = hold * 2
+    for m in mhts:
+        x_max = max(x_max, min(m * 1.1, hold * 10))
+    xs = np.linspace(x_max / 400, x_max, 400)
+    xs = np.unique(np.append(xs, [m for m in mhts if m <= x_max]))
+
+    fig = go.Figure()
+    shown = []
+    for s in specs:
+        ys = np.array([rest_time_seconds(s['ra'], pct, x, s['et']) for x in xs])
+        shown.extend(ys[np.isfinite(ys)].tolist())
+        fig.add_trace(go.Scatter(
+            x=xs, y=ys, mode='lines', name=s['active_name'], line=dict(color=s['color'], width=3, dash=s['dash']),
+            hovertemplate=f"<b>{s['short']}: {s['ra']}</b><br>Holding: %{{x:.1f}} s<br>Rest: %{{y:.1f}} s<extra></extra>"
+        ))
+    shared_mht = specs[0]['et'] and specs[0]['et'] == specs[1]['et']
+    for s in specs:
+        if s['et'] and not (shared_mht and s['slot'] == 2):
+            m = mht_seconds(pct / 100, s['et'])
+            if np.isfinite(m) and m <= x_max:
+                fig.add_vline(x=m, line_dash="dot", opacity=0.8,
+                              line_color=COLORS['simcoe_blue'] if shared_mht else s['color'],
+                              annotation_text=(f"MHT = {m:.1f} s (both)" if shared_mht
+                                               else f"{s['short']} MHT = {m:.1f} s"),
+                              annotation_position="top left" if s['slot'] == 1 else "top right",
+                              annotation_font_color=COLORS['simcoe_blue'] if shared_mht else s['color'])
+    for s in specs:
+        if s['res'].ok:
+            _spec_star(fig, s, hold, s['res'].rest_s)
+            shown.append(s['res'].rest_s)
+    y_max = max(shown) * 1.1 if shown and max(shown) > 0 else None
+    return _layout(fig, f"Rest Time vs Holding Time at {pct:g}% MVC", "Holding Time (seconds)",
+                   "Rest Time (seconds)", y_scale, x_range=[0, x_max], y_range=[0, y_max] if y_max else None)
+
+
+def cmp_rest_vs_intensity(specs, pct, hold, y_scale):
+    grid = np.unique(np.append(np.arange(0.5, 100.01, 0.5), pct))
+    fig = go.Figure()
+    shown = []
+    for s in specs:
+        xs, ys = piecewise_curve(s, grid, lambda p, x: rest_time_seconds(p['ra'], x, hold, p['et']))
+        shown.extend(ys[np.isfinite(ys)].tolist())
+        fig.add_trace(go.Scatter(
+            x=xs, y=ys, mode='lines', name=s['name'], line=dict(color=s['color'], width=3, dash=s['dash']),
+            hovertemplate=f"<b>{s['short']}</b><br>Intensity: %{{x:.1f}}% MVC<br>Rest: %{{y:.1f}} s<extra></extra>"
+        ))
+    fig.add_vline(x=15, line_dash="dot", line_color=COLORS['dark_grey'], opacity=0.6,
+                  annotation_text="15% MVC", annotation_position="top right")
+    _add_transition_lines(fig, specs)
+    for s in specs:
+        if s['res'].ok:
+            _spec_star(fig, s, pct, s['res'].rest_s)
+    y_max = max(shown) * 1.05 if shown and max(shown) > 0 else None
+    return _layout(fig, f"Rest Time vs Intensity for a {hold:g} s Hold", "Intensity (% MVC)",
+                   "Rest Time (seconds)", y_scale, x_range=[0, 100], y_range=[0, y_max] if y_max else None)
+
+
+def cmp_work_rest_cycles(specs):
+    labels = [f"<b>Model {s['slot']}</b>: {s['ra']}" for s in specs]
+    holds = [s['res'].holding_s if s['res'].ok else 0 for s in specs]
+    rests = [s['res'].rest_s if s['res'].ok else 0 for s in specs]
+    fig = go.Figure()
+    fig.add_trace(go.Bar(
+        y=labels, x=holds, orientation='h', name='Hold (work)', marker_color=COLORS['cool_grey'],
+        text=[f"{h:.1f} s" if h else "" for h in holds], textposition='inside',
+        hovertemplate="Hold: %{x:.1f} s<extra></extra>"
+    ))
+    fig.add_trace(go.Bar(
+        y=labels, x=rests, orientation='h', name='Rest (model colour)',
+        marker=dict(color=[s['color'] for s in specs], line=dict(color='black', width=1)),
+        text=[f"{r:.1f} s" if r else "" for r in rests], textposition='outside', cliponaxis=False,
+        textfont=dict(color='black'),
+        hovertemplate="Rest: %{x:.1f} s<extra></extra>"
+    ))
+    for lab, s in zip(labels, specs):
+        if not s['res'].ok:
+            fig.add_annotation(y=lab, x=0, text=f"N/A: {short_status(s['res'])}", showarrow=False,
+                               xanchor='left', font=dict(color=COLORS['simcoe_blue']))
+    fig.update_layout(
+        barmode='stack',
+        title=dict(text="One Work–Rest Cycle per Model", font=dict(size=20, color=COLORS['future_blue']), x=0.5),
+        xaxis=dict(title="Time (seconds)", gridcolor='lightgray',
+                   range=[0, max([h + r for h, r in zip(holds, rests)] + [1]) * 1.15]),
+        yaxis=dict(autorange='reversed', automargin=True),
+        margin=dict(l=230), plot_bgcolor='white', height=320,
+        legend=dict(orientation='h', yanchor='bottom', y=1.0, xanchor='right', x=1),
+    )
+    return fig
+
+
+def cmp_et_curves(specs, pct, hold, y_scale):
+    used = [s for s in specs if spec_mht_any(s)]
+    if not used:
+        return None
+    grid = np.linspace(1, 100, 500)
+    fig = go.Figure()
+    refs = [hold]
+    for s in used:
+        xs, ys = piecewise_curve(s, grid, lambda p, x: mht_seconds(x / 100, p['et']) if p['et'] else np.nan)
+        if s['T'] is None:
+            name = f"{s['short']}: {s['parts'][0]['et']}"
+        else:
+            name = (f"{s['short']}: {s['parts'][0]['et'] or '—'} (<{s['T']:g}%) | "
+                    f"{s['parts'][1]['et'] or '—'} (≥{s['T']:g}%)")
+        fig.add_trace(go.Scatter(
+            x=xs, y=ys, mode='lines', name=name, line=dict(color=s['color'], width=3, dash=s['dash']),
+            hovertemplate=f"<b>{s['short']}</b><br>Intensity: %{{x:.1f}}% MVC<br>MHT: %{{y:.1f}} s<extra></extra>"
+        ))
+    fig.add_hline(y=hold, line_dash="dash", line_color=COLORS['dark_grey'], opacity=0.8,
+                  annotation_text=f"Holding time = {hold:g} s")
+    fig.add_vline(x=pct, line_dash="dash", line_color=COLORS['dark_grey'], opacity=0.4)
+    _add_transition_lines(fig, used)
+    for s in used:
+        if s['et']:
+            m = mht_seconds(pct / 100, s['et'])
+            if np.isfinite(m):
+                refs.append(m)
+                _star(fig, pct, m, f"<b>Model {s['slot']} MHT at {pct:g}% MVC</b><br>{s['et']}<br>"
+                                   f"{m:.1f} s ({m / 60:.2f} min)",
+                      color=s['color'], name=f"Model {s['slot']} MHT")
+    _layout(fig, "Endurance Time Curves Supplying MHT", "Intensity (% MVC)", "Maximum Holding Time (seconds)",
+            y_scale, x_range=[0, 100], y_range=[0, max(refs) * 3])
+    fig.update_layout(legend=dict(xanchor="right", x=0.99))
+    return fig
+
+
+def cmp_auto_xmax(specs, holding_s):
+    return max(overview_auto_xmax(p['ra'], p['et'], False, holding_s) for s in specs for p in s['parts'])
+
+
+def _in_part(spec, side, pcts):
+    pcts = np.asarray(pcts, float)
+    if spec['T'] is None:
+        return np.ones(pcts.shape, bool)
+    return pcts < spec['T'] if side == 0 else pcts >= spec['T']
+
+
+def cmp_overview(specs, hold_max, show_star, log_y, normalised):
+    """10% MVC iso-intensity lines for both models: Model 1 solid, Model 2 dashed, each in its colour.
+    For a piecewise model, each intensity line comes from the part in force at that intensity."""
+    fig = go.Figure()
+    xkey, ykey = ('fmht', 'ra') if normalised else ('hold', 'rest')
+    all_y, ends = [], []
+    for s in specs:
+        first_line, first_bound, spec_ends = True, True, []
+        for side, part in enumerate(s['parts']):
+            if part['et'] and not normalised:
+                bp, bx, by = exhaustion_boundary(part['ra'], part['et'], hold_max)
+                keep = _in_part(s, side, bp) if len(bp) else np.array([], bool)
+                if keep.any():
+                    fig.add_trace(go.Scatter(
+                        x=bx[keep], y=by[keep], mode='lines', name=f"{s['short']} exhaustion boundary",
+                        legendgroup=f"m{s['slot']}b", showlegend=first_bound,
+                        line=dict(color=s['color'], width=1, dash='dot'), opacity=0.7, customdata=bp[keep],
+                        hovertemplate=f"<b>{s['short']} exhaustion boundary</b><br>%{{customdata:.1f}}% MVC<br>"
+                                      "Hold = MHT = %{x:,.1f} s<br>Rest: %{y:,.1f} s<extra></extra>"
+                    ))
+                    first_bound = False
+                    all_y.extend(by[keep].tolist())
+            for c in overview_curves(part['ra'], part['et'], hold_max, False, normalised):
+                if not _in_part(s, side, [c['p']])[0]:
+                    continue
+                xs, ys = c[xkey], c[ykey]
+                if normalised:
+                    hover = (f"<b>{s['short']}: {c['p']}% MVC</b> ({part['ra']})<br>fMHT: %{{x:.3f}}<br>"
+                             f"RA: %{{y:,.1f}}%<br>Holding: %{{customdata[0]:,.1f}} s<br>"
+                             f"Rest: %{{customdata[1]:,.1f}} s<extra></extra>")
+                    cd = np.column_stack([c['hold'], c['rest']])
+                else:
+                    hover = (f"<b>{s['short']}: {c['p']}% MVC</b> ({part['ra']})<br>Holding: %{{x:,.1f}} s<br>"
+                             f"Rest: %{{y:,.1f}} s<extra></extra>")
+                    cd = None
+                fig.add_trace(go.Scatter(
+                    x=xs, y=ys, mode='lines', name=s['name'], legendgroup=f"m{s['slot']}", showlegend=first_line,
+                    line=dict(color=s['color'], width=2, dash=s['dash']), customdata=cd, hovertemplate=hover
+                ))
+                first_line = False
+                finite = np.isfinite(ys)
+                all_y.extend(ys[finite].tolist())
+                if np.any(ys[finite] > 0):
+                    i = np.where(finite)[0][-1]
+                    spec_ends.append((c['p'], xs[i], ys[i]))
+        for g in _group_end_labels(spec_ends):
+            ends.append((s, min(g['ps']), g['x'], g['y'], g['text']))
+
+    star_specs = []
+    if show_star:
+        for s in specs:
+            r = s['res']
+            if r.ok and (not normalised or np.isfinite(r.fmht)):
+                star_specs.append(s)
+                all_y.append(r.ra_pct if normalised else r.rest_s)
+    pos = [v for v in all_y if v > 0]
+    y_top = max(pos) if pos else 1.0
+    y_floor = y_top / 10 ** LOG_DECADES
+
+    def y_pos(v):
+        return np.log10(max(v, y_floor)) if log_y else v
+
+    # End labels, skipping overlaps across both models
+    x_span = 1.0 if normalised else hold_max
+    y_lo, y_hi = (np.log10(y_floor), np.log10(y_top)) if log_y else (0.0, y_top)
+    placed = []
+    for s, p, x, y, text in sorted(ends, key=lambda e: e[1]):
+        gx, gy = x / x_span, (y_pos(y) - y_lo) / max(y_hi - y_lo, 1e-12)
+        if any(abs(gx - px) < 0.06 and abs(gy - py) < 0.035 for px, py in placed):
+            continue
+        placed.append((gx, gy))
+        fig.add_annotation(x=x, y=y_pos(y), text=text, showarrow=False, xanchor='left', xshift=4,
+                           font=dict(size=11, color=s['color']))
+
+    x_max = 1.0 if normalised else hold_max
+    for s in star_specs:
+        r = s['res']
+        if normalised:
+            _star(fig, r.fmht, r.ra_pct,
+                  f"<b>Model {s['slot']}</b> ({r.model})<br>fMHT = {r.fmht:.3f}<br>"
+                  f"RA: {r.ra_pct:.1f}% · Rest: {r.rest_s:.1f} s",
+                  color=s['color'], name=f"Model {s['slot']} prediction")
+        else:
+            _spec_star(fig, s, r.holding_s, r.rest_s)
+            x_max = max(x_max, r.holding_s)
+
+    if normalised:
+        title, xt, yt = "Model Overview, normalised to MHT", "fMHT (holding time ÷ MHT)", "Rest Allowance (% of holding time)"
+    else:
+        title, xt, yt = "Model Overview (10% MVC lines)", "Holding Time (seconds)", "Rest Time (seconds)"
+    _layout(fig, title, xt, yt, 'log' if log_y else 'linear', x_range=[0, x_max * 1.07], height=680)
+    if log_y:
+        fig.update_yaxes(range=[np.log10(y_floor), np.log10(y_top * 1.5)], dtick=1)
+    fig.update_layout(title=dict(font=dict(size=18)),
+                      legend=dict(orientation='h', yanchor='top', y=-0.14, xanchor='left', x=0,
+                                  bgcolor='rgba(255,255,255,0)'))
+    return fig
+
+
+def _symlog(v):
+    return np.sign(v) * np.log10(1 + np.abs(v))
+
+
+def spec_heatmap_grid(spec, hold_max):
+    """Rest-time grid for a spec; piecewise specs take the secondary part's columns at/above T."""
+    p0 = spec['parts'][0]
+    xs, ys, z = heatmap_grid(p0['ra'], p0['et'], hold_max)
+    if spec['T'] is not None:
+        p1 = spec['parts'][1]
+        _, _, zb = heatmap_grid(p1['ra'], p1['et'], hold_max)
+        z = np.where(xs[None, :] < spec['T'], z, zb)
+    return xs, ys, z
+
+
+def cmp_difference_heatmap(specs, hold_max, current_pct, current_hold, show_star):
+    s1, s2 = specs
+    xs, ys, z1 = spec_heatmap_grid(s1, hold_max)
+    _, _, z2 = spec_heatmap_grid(s2, hold_max)
+    d = z2 - z1                                    # NaN wherever either model is undefined
+    t = _symlog(d)
+    zmax = float(np.nanmax(np.abs(t))) if np.any(np.isfinite(t)) else 1.0
+    zmax = max(zmax, 0.5)
+    mags = [v for v in [10, 100, 1_000, 10_000, 100_000, 1_000_000] if np.log10(1 + v) <= zmax * 1.01]
+    tickvals = [-_symlog(v) for v in reversed(mags)] + [0] + [_symlog(v) for v in mags]
+    ticktext = [f"−{v:,}" for v in reversed(mags)] + ["0"] + [f"+{v:,}" for v in mags]
+    fig = go.Figure(go.Heatmap(
+        x=xs, y=ys, z=t, zmid=0, zmin=-zmax, zmax=zmax, colorscale='RdBu_r',
+        customdata=np.dstack([z1, z2, d]),
+        colorbar=dict(title=dict(text="M2 − M1<br>rest (s)"), tickvals=tickvals, ticktext=ticktext),
+        hovertemplate="Intensity: %{x:.0f}% MVC<br>Holding: %{y:.1f} s<br>"
+                      "M1 rest: %{customdata[0]:,.1f} s<br>M2 rest: %{customdata[1]:,.1f} s<br>"
+                      "<b>M2 − M1: %{customdata[2]:+,.1f} s</b><extra></extra>",
+        hoverongaps=False,
+    ))
+    for T, label, _, pos in _transition_marks(specs):
+        fig.add_vline(x=T, line_dash="dashdot", line_color='black', line_width=1.5, annotation_text=label,
+                      annotation_font_color='black', annotation_position=pos.replace("bottom", "top"))
+    if show_star and current_hold <= hold_max and (s1['res'].ok or s2['res'].ok):
+        d_now = (s2['res'].rest_s - s1['res'].rest_s) if (s1['res'].ok and s2['res'].ok) else np.nan
+        _star(fig, current_pct, current_hold,
+              f"<b>Current Task</b><br>{current_pct:g}% MVC, {current_hold:g} s hold<br>"
+              + (f"M2 − M1: {d_now:+.1f} s" if np.isfinite(d_now) else "Difference: N/A"))
+    fig.update_layout(
+        title=dict(text="Rest Time Difference Heatmap (Model 2 − Model 1)",
+                   font=dict(size=18, color=COLORS['future_blue']), x=0.5),
+        xaxis=dict(title="Intensity (% MVC)"), yaxis=dict(title="Holding Time (seconds)"),
+        plot_bgcolor='white', height=560, showlegend=False,
     )
     return fig
 
@@ -717,23 +1173,10 @@ if st.session_state.current_page == "Calculator":
     st.markdown("### Model Selection")
     c1, c2 = st.columns(2)
     with c1:
-        st.markdown("**Rest Allowance Model**")
-        st.selectbox("RA Model:", RA_MODEL_ORDER, **_bind('ra_model'))
-        ra_model = st.session_state.ra_model
-        st.markdown(f"""
-        <div class="model-card">
-            <b>{ra_model}</b><br>
-            <code>{RA_MODEL_INFO[ra_model]['equation_text']}</code><br>
-            <small>Inputs: {RA_MODEL_INFO[ra_model]['inputs']}</small>
-        </div>
-        """, unsafe_allow_html=True)
-        render_ra_model_info(ra_model)
+        ra_model = render_ra_selector()
     with c2:
         uses_mht = model_uses_mht(ra_model)
-        et_model = render_et_selector(
-            uses_mht,
-            disabled_reason=f"Not required: {ra_model} uses %MVC only and does not consider MHT."
-        )
+        et_model = render_et_selector(uses_mht, disabled_reason=not_required_reason(ra_model))
 
     res = compute_rest_allowance(ra_model, pct_mvc, holding_s, et_model if uses_mht else None)
     all_results = [compute_rest_allowance(m, pct_mvc, holding_s, et_model) for m in RA_MODEL_ORDER]
@@ -761,8 +1204,8 @@ if st.session_state.current_page == "Calculator":
     plot_models = RA_MODEL_ORDER if overlay else [ra_model]
     plot_et = et_model if (uses_mht or overlay) else None
 
-    tab1, tab2, tab3, tab4, tab5 = st.tabs(["Rest vs Holding Time", "Rest vs Intensity", "Work–Rest Cycle",
-                                            "Endurance Time (MHT)", "Model Overview"])
+    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["Rest vs Holding Time", "Rest vs Intensity", "Work–Rest Cycle",
+                                                  "Endurance Time (MHT)", "Model Overview", "Rest Time Heatmap"])
     with tab1:
         show_chart(plot_rest_vs_holding(res, plot_models, plot_et, y_scale_val), width="stretch")
         st.caption("MHT-based curves end where holding time reaches MHT (fMHT = 1); beyond that the task cannot be sustained.")
@@ -825,6 +1268,29 @@ if st.session_state.current_page == "Calculator":
             st.warning(f"The current task can't be starred: {short_status(res).lower()}.")
         elif show_star and normalised and not np.isfinite(res.fmht):
             st.warning("The current task can't be starred in the normalised view: MHT is undefined at this intensity.")
+    with tab6:
+        h1, h2 = st.columns([1, 1.4])
+        with h1:
+            hm_star = st.checkbox("Show current task (★)", value=True, key="hm_star")
+        with h2:
+            hm_user = st.number_input("Max holding time shown (s)", min_value=1.0, value=None,
+                                      step=60.0, format="%.0f", placeholder="Auto", key="hm_ymax",
+                                      help="Upper limit of the holding-time axis. Leave blank for automatic: "
+                                           "the same range as the Model Overview (MHT at 20% MVC for the "
+                                           f"selected ET model, up to {OVERVIEW_AUTO_CAP_S:,} s).")
+        hm_max = float(hm_user) if hm_user else overview_auto_xmax(ra_model, et_model, True, holding_s)
+        with st.spinner("Calculating heatmap..."):
+            show_chart(plot_heatmap(ra_model, et_model if uses_mht else None, hm_max, res, hm_star), width="stretch")
+        st.caption("Rest time for every combination of intensity (1–100% MVC) and holding time, for the selected "
+                   "RA and ET models. "
+                   + ("Blank cells are outside the model's valid domain (holding time > MHT, ET undefined"
+                      + (", or Milner fMHT ≤ 0.01" if ra_model == MILNER_1985 else "") + "). "
+                      if uses_mht else "")
+                   + "Colour scale is logarithmic in rest seconds. Drag to zoom, double-click to reset.")
+        if hm_star and not res.ok:
+            st.warning(f"The current task can't be starred: {short_status(res).lower()}.")
+        elif hm_star and res.holding_s > hm_max:
+            st.warning("The current task's holding time is above the axis range; increase the max holding time to see it.")
 
 
 # ============================================================================
@@ -832,63 +1298,148 @@ if st.session_state.current_page == "Calculator":
 # ============================================================================
 elif st.session_state.current_page == "Compare":
     st.title("Rest Allowance Model Comparison")
-    st.markdown("*Compare all four rest allowance models for the same task*")
+    st.markdown("*Compare two rest allowance + endurance time model pairings for the same task*")
     st.markdown("---")
 
     pct_mvc, holding_s = render_task_inputs()
-    st.markdown("---")
-    c1, _ = st.columns(2)
-    with c1:
-        et_model = render_et_selector(True)
-        st.caption("Supplies MHT to Rohmert (1973), Milner (1985) and Rose et al. (1992).")
-
-    results = [compute_rest_allowance(m, pct_mvc, holding_s, et_model) for m in RA_MODEL_ORDER]
 
     st.markdown("---")
-    st.markdown("### Comparison Table")
-    df = pd.DataFrame([{
-        'RA Model': r.model,
-        'Uses MHT': 'Yes' if model_uses_mht(r.model) else 'No',
-        'MHT (s)': round(r.mht_s, 1) if np.isfinite(r.mht_s) else None,
-        'fMHT': round(r.fmht, 3) if np.isfinite(r.fmht) else None,
-        'RA (%)': round(r.ra_pct, 1) if np.isfinite(r.ra_pct) else None,
-        'Rest Time (s)': round(r.rest_s, 1) if np.isfinite(r.rest_s) else None,
-        'Cycle (s)': round(r.cycle_s, 1) if np.isfinite(r.cycle_s) else None,
-        'Duty Cycle (%)': round(r.duty_cycle * 100, 1) if np.isfinite(r.duty_cycle) else None,
-        'Status': short_status(r),
-    } for r in results])
-    st.dataframe(df, width="stretch", hide_index=True)
-    for r in results:
-        if r.status not in ('ok',) and r.message:
-            st.caption(f"**{r.model}:** {r.message}")
+    sel_cols = st.columns(2, gap="large")
+    for slot, col in zip((1, 2), sel_cols):
+        with col:
+            st.markdown(f"### Model {slot} Selection")
+            st.checkbox("Use compound/piecewise function",
+                        help="Join two RA + ET pairings at a transition intensity: the primary model applies "
+                             "below it and the secondary model at and above it.",
+                        **_bind(f"cmp{slot}_pw"))
+            piecewise = st.session_state[f"cmp{slot}_pw"]
+            if piecewise:
+                st.number_input("Transition intensity (% MVC)", min_value=1.0, max_value=99.0, step=1.0,
+                                format="%.1f", **_bind(f"cmp{slot}_pw_t"))
+                t_sel = st.session_state[f"cmp{slot}_pw_t"]
+                st.markdown(f"#### Primary Model (< {t_sel:g}% MVC)")
+            ra_sel = render_ra_selector(prefix=f"cmp{slot}_")
+            render_et_selector(model_uses_mht(ra_sel), disabled_reason=not_required_reason(ra_sel),
+                               prefix=f"cmp{slot}_")
+            if piecewise:
+                st.markdown(f"#### Secondary Model (≥ {t_sel:g}% MVC)")
+                ra_b = render_ra_selector(prefix=f"cmp{slot}b_")
+                render_et_selector(model_uses_mht(ra_b), disabled_reason=not_required_reason(ra_b),
+                                   prefix=f"cmp{slot}b_")
+
+    specs = build_compare_specs(pct_mvc, holding_s)
+    s1, s2 = specs
+    both_mht = spec_mht_all(s1) and spec_mht_all(s2)
 
     st.markdown("---")
-    st.markdown("### Rest Time by Model")
-    fig = go.Figure(go.Bar(
-        x=[r.model for r in results],
-        y=[r.rest_s if r.ok else 0 for r in results],
-        marker_color=[RA_COLORS[r.model] for r in results],
-        text=[f"{r.rest_s:.1f} s" if r.ok else "N/A" for r in results], textposition='outside',
-        hovertemplate="%{x}<br>Rest: %{y:.1f} s<extra></extra>",
-    ))
-    _layout(fig, f"Rest Time for a {holding_s:g} s Hold at {pct_mvc:g}% MVC", "", "Rest Time (seconds)",
-            y_scale_val, height=450)
-    fig.update_layout(showlegend=False)
-    show_chart(fig, width="stretch")
+    st.markdown("### Results")
+    res_cols = st.columns(2, gap="large")
+    for s, col in zip(specs, res_cols):
+        with col:
+            heading = f"Model {s['slot']}"
+            if s['T'] is not None:
+                heading += (f" · {'secondary' if pct_mvc >= s['T'] else 'primary'} model applies "
+                            f"({pct_mvc:g}% {'≥' if pct_mvc >= s['T'] else '<'} {s['T']:g}% transition)")
+            result_card(s['res'], accent=s['color'], heading=heading)
+            if s['res'].status in ('infeasible', 'out_of_domain', 'et_undefined', 'invalid_input'):
+                st.error(s['res'].message)
+            elif s['res'].status == 'no_fatigue':
+                st.info(s['res'].message)
+
+    d1, d2, d3 = st.columns(3)
+    if s1['res'].ok and s2['res'].ok:
+        diff = s2['res'].rest_s - s1['res'].rest_s
+        d1.metric("Difference (Model 2 − Model 1)", f"{diff:+,.1f} s")
+        d2.metric("Ratio (Model 2 ÷ Model 1)", f"×{s2['res'].rest_s / s1['res'].rest_s:,.2f}"
+                  if s1['res'].rest_s > 0 else "—")
+        d3.metric("More rest predicted by",
+                  "Equal" if np.isclose(diff, 0) else ("Model 2" if diff > 0 else "Model 1"))
+    else:
+        d1.metric("Difference (Model 2 − Model 1)", "—")
+        d2.metric("Ratio (Model 2 ÷ Model 1)", "—")
+        d3.metric("More rest predicted by", "—")
+    if specs_identical(s1, s2):
+        st.info("Model 1 and Model 2 are the same, so their curves overlap exactly.")
 
     st.markdown("---")
-    st.markdown("### Rest Time Map (Intensity × Holding Time)")
-    h1, h2 = st.columns(2)
-    with h1:
-        st.selectbox("RA Model:", RA_MODEL_ORDER, **_bind('heatmap_model'))
-    with h2:
-        hold_max = st.slider("Max Holding Time (s)", 10, 600, int(max(60, min(600, holding_s * 2))), step=10)
-    hm_model = st.session_state.heatmap_model
-    current = compute_rest_allowance(hm_model, pct_mvc, holding_s, et_model)
-    show_chart(plot_heatmap(hm_model, et_model if model_uses_mht(hm_model) else None, hold_max, current),
-                    width="stretch")
-    st.caption("Blank cells are outside the model's valid domain (holding time > MHT, ET undefined, or "
-               "Milner fMHT ≤ 0.01). Colour scale is logarithmic in rest seconds.")
+    st.markdown("### Interactive Plots")
+    st.caption("Model 1 is drawn solid and Model 2 dashed, each in its RA model's colour (Model 2 is lightened "
+               "when both use the same RA model). Stars mark each model's prediction for the current task.")
+    c1t, c2t, c3t, c4t, c5t, c6t = st.tabs(["Rest vs Holding Time", "Rest vs Intensity", "Work–Rest Cycle",
+                                            "Endurance Time (MHT)", "Model Overview",
+                                            "Rest Time Difference Heatmap"])
+    with c1t:
+        show_chart(cmp_rest_vs_holding(specs, pct_mvc, holding_s, y_scale_val))
+        st.caption("MHT-based curves end where holding time reaches that model's MHT (dotted line)."
+                   + (" At a fixed intensity, a piecewise model uses whichever part is in force at the task "
+                      "intensity, named in the legend." if (s1['T'] is not None or s2['T'] is not None) else ""))
+    with c2t:
+        show_chart(cmp_rest_vs_intensity(specs, pct_mvc, holding_s, y_scale_val))
+        st.caption("MHT-based curves end at the intensity where MHT falls below the holding time."
+                   + (" Piecewise models are drawn with a break at their transition (dash-dot line): the step "
+                      "there comes from joining two models, not from physiology."
+                      if (s1['T'] is not None or s2['T'] is not None) else ""))
+    with c3t:
+        show_chart(cmp_work_rest_cycles(specs))
+    with c4t:
+        et_fig = cmp_et_curves(specs, pct_mvc, holding_s, y_scale_val)
+        if et_fig is None:
+            st.info("Neither model uses MHT, so there is no endurance time curve to show.")
+        else:
+            show_chart(et_fig)
+            if s1['T'] is None and s2['T'] is None and s1['et'] and s1['et'] == s2['et']:
+                st.caption("Both models use the same ET model, so the curves overlap.")
+            elif not (spec_mht_any(s1) and spec_mht_any(s2)):
+                st.caption("Only one of the two models uses MHT.")
+            if s1['T'] is not None or s2['T'] is not None:
+                st.caption("Piecewise models switch ET model at their transition (dash-dot line); a gap in a "
+                           "curve means that part's RA model does not use MHT.")
+    with c5t:
+        o1, o2, o3 = st.columns([1, 1, 1.4])
+        with o1:
+            cmp_ov_star = st.checkbox("Show model predictions (★)", value=True, key="cmp_ov_star")
+            cmp_ov_log = st.checkbox("Log scale (y-axis)", value=(y_scale_val == 'log'), key="cmp_ov_log")
+        with o2:
+            cmp_ov_norm = st.checkbox(
+                "Normalise to MHT (fMHT)", value=False, key="cmp_ov_norm", disabled=not both_mht,
+                help="x = holding time ÷ MHT (0–1), y = rest allowance as % of holding time."
+                     if both_mht else "Available when both models use MHT."
+            )
+            cmp_ov_norm = cmp_ov_norm and both_mht
+        with o3:
+            cmp_ov_user = st.number_input("Max holding time shown (s)", min_value=1.0, value=None, step=60.0,
+                                          format="%.0f", placeholder="Auto", key="cmp_ov_xmax",
+                                          disabled=cmp_ov_norm,
+                                          help="Leave blank for automatic: the longer of the two models' "
+                                               "default ranges.")
+        cmp_ov_max = float(cmp_ov_user) if cmp_ov_user else cmp_auto_xmax(specs, holding_s)
+        show_chart(cmp_overview(specs, cmp_ov_max, cmp_ov_star, cmp_ov_log, cmp_ov_norm))
+        st.caption("Lines every 10% MVC for each model, labelled at their ends. "
+                   + ("For a piecewise model, each line comes from the part in force at that intensity. "
+                      if (s1['T'] is not None or s2['T'] is not None) else "")
+                   + ("MHT-based lines end at MHT; the dotted lines are each model's exhaustion boundary. "
+                      if not cmp_ov_norm else "")
+                   + ("On the log scale, lines at RA = 0 are not shown. " if cmp_ov_log else "")
+                   + "Drag to zoom, double-click to reset.")
+    with c6t:
+        h1, h2 = st.columns([1, 1.4])
+        with h1:
+            cmp_hm_star = st.checkbox("Show current task (★)", value=True, key="cmp_hm_star")
+        with h2:
+            cmp_hm_user = st.number_input("Max holding time shown (s)", min_value=1.0, value=None, step=60.0,
+                                          format="%.0f", placeholder="Auto", key="cmp_hm_xmax",
+                                          help="Leave blank for automatic: the longer of the two models' "
+                                               "default ranges.")
+        cmp_hm_max = float(cmp_hm_user) if cmp_hm_user else cmp_auto_xmax(specs, holding_s)
+        with st.spinner("Calculating heatmap..."):
+            show_chart(cmp_difference_heatmap(specs, cmp_hm_max, pct_mvc, holding_s, cmp_hm_star))
+        st.caption("Red: Model 2 predicts more rest. Blue: Model 1 predicts more rest. White: they agree. "
+                   + ("Dash-dot lines mark piecewise transitions. " if (s1['T'] is not None or s2['T'] is not None) else "")
+                   +
+                   "Blank cells are outside the valid domain of either model. Colour scale is logarithmic "
+                   "in seconds of difference. Drag to zoom, double-click to reset.")
+        if cmp_hm_star and holding_s > cmp_hm_max:
+            st.warning("The current task's holding time is above the axis range; increase the max holding time to see it.")
 
 
 # ============================================================================
